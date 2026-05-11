@@ -61,8 +61,7 @@ CUDA_VISIBLE_DEVICES=0 python test.py --model_path ./checkpoints/FSI-Net/model_e
 
 ## Data Availability
 
-Source code: [GitHub](https://github.com/hejiaxin-2002/FSI-Net-Generalizable-Deepfake-Detection). A DOI-tagged version is archived on Zenodo: [DOI will be added upon release].
-
+Source code: [GitHub](https://github.com/hejiaxin-2002/FSI-Net-Generalizable-Deepfake-Detection).
 
 ---
 

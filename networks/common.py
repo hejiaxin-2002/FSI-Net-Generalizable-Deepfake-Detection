@@ -1,419 +1,329 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from einops import rearrange
-from timm.models.layers import DropPath, trunc_normal_
-from pytorch_wavelets import DWTForward
 
 
-class BasicConv(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
-                 bn=True, bias=False):
-        super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
-                              dilation=dilation, groups=groups, bias=bias)
-        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
-        self.relu = nn.ReLU(inplace=True) if relu else None
-
-    def forward(self, x):
-        x = self.conv(x)
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
-
-
-class Conv(nn.Sequential):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, stride=1, bias=False):
-        super(Conv, self).__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, bias=bias,
-                      dilation=dilation, stride=stride, padding=((stride - 1) + dilation * (kernel_size - 1)) // 2)
-        )
-
-
-class Bconv(nn.Module):
-    def __init__(self, ch_in, ch_out, k, s):
-        super(Bconv, self).__init__()
-        self.conv = nn.Conv2d(ch_in, ch_out, k, s, padding=k // 2)
-        self.bn = nn.BatchNorm2d(ch_out)
-        self.act = nn.SiLU()
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-
-class SeparableConvBN(nn.Sequential):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dilation=1,
-                 norm_layer=nn.BatchNorm2d):
-        super(SeparableConvBN, self).__init__(
-            nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, dilation=dilation,
-                      padding=((stride - 1) + dilation * (kernel_size - 1)) // 2,
-                      groups=in_channels, bias=False),
-            norm_layer(out_channels),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        )
-
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU6, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Conv2d(in_features, hidden_features, 1, 1, 0, bias=True)
-        self.act = act_layer()
-        self.fc2 = nn.Conv2d(hidden_features, out_features, 1, 1, 0, bias=True)
-        self.drop = nn.Dropout(drop, inplace=True)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-
-class SppCSPC(nn.Module):
-    def __init__(self, ch_in, ch_out):
-        super(SppCSPC, self).__init__()
-        # 分支一
-        self.conv1 = nn.Sequential(
-            Bconv(ch_in, ch_out, 1, 1),
-            Bconv(ch_out, ch_out, 3, 1),
-            Bconv(ch_out, ch_out, 1, 1)
-        )
-        # 分支二（SPP）
-        self.mp1 = nn.MaxPool2d(5, 1, 5 // 2)  # 卷积核为5的池化
-        self.mp2 = nn.MaxPool2d(9, 1, 9 // 2)  # 卷积核为9的池化
-        self.mp3 = nn.MaxPool2d(13, 1, 13 // 2)  # 卷积核为13的池化
-
-        # concat之后的卷积
-        self.conv1_2 = nn.Sequential(
-            Bconv(4 * ch_out, ch_out, 1, 1),
-            Bconv(ch_out, ch_out, 3, 1)
-        )
-
-        # 分支三
-        self.conv3 = Bconv(ch_in, ch_out, 1, 1)
-
-        # 此模块最后一层卷积
-        self.conv4 = Bconv(2 * ch_out, ch_out, 1, 1)
-
-    def forward(self, x):
-        # 分支一输出
-        output1 = self.conv1(x)
-
-        # 分支二池化层的各个输出
-        mp_output1 = self.mp1(output1)
-        mp_output2 = self.mp2(output1)
-        mp_output3 = self.mp3(output1)
-
-        # 合并以上并进行卷积
-        result1 = self.conv1_2(torch.cat((output1, mp_output1, mp_output2, mp_output3), dim=1))
-
-        # 分支三
-        result2 = self.conv3(x)
-
-        return self.conv4(torch.cat((result1, result2), dim=1))
-
-
-class GlobalAttention(nn.Module):
-    def __init__(self,
-                 dim=256,
-                 num_heads=16,
-                 qkv_bias=False,
-                 window_size=8,
-                 relative_pos_embedding=True
-                 ):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // self.num_heads
-        self.scale = head_dim ** -0.5
-        self.ws = window_size
-
-        self.qkv = Conv(dim, 3*dim, kernel_size=1, bias=qkv_bias)
-        self.proj = SeparableConvBN(dim, dim, kernel_size=window_size)
-
-        self.attn_x = nn.Conv2d(dim, dim, kernel_size=(window_size, 1), stride=1, padding=(window_size//2 - 1, 0))
-        self.attn_y = nn.Conv2d(dim, dim, kernel_size=(1, window_size), stride=1, padding=(0, window_size//2 - 1))
-
-        self.relative_pos_embedding = relative_pos_embedding
-
-        if self.relative_pos_embedding:
-            # define a parameter table of relative position bias
-            self.relative_position_bias_table = nn.Parameter(
-                torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-
-            # get pair-wise relative position index for each token inside the window
-            coords_h = torch.arange(self.ws)
-            coords_w = torch.arange(self.ws)
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
-            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-            relative_coords[:, :, 0] += self.ws - 1  # shift to start from 0
-            relative_coords[:, :, 1] += self.ws - 1
-            relative_coords[:, :, 0] *= 2 * self.ws - 1
-            relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-            self.register_buffer("relative_position_index", relative_position_index)
-
-            trunc_normal_(self.relative_position_bias_table, std=.02)
-
-    def pad(self, x, ps):
-        _, _, H, W = x.size()
-        if W % ps != 0:
-            x = F.pad(x, (0, ps - W % ps), mode='reflect')
-        if H % ps != 0:
-            x = F.pad(x, (0, 0, 0, ps - H % ps), mode='reflect')
-        return x
-
-    def pad_out(self, x):
-        x = F.pad(x, pad=(0, 1, 0, 1), mode='reflect')
-        return x
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x = self.pad(x, self.ws)
-        B, C, Hp, Wp = x.shape
-        qkv = self.qkv(x)
-
-        q, k, v = rearrange(qkv, 'b (qkv h d) (hh ws1) (ww ws2) -> qkv (b hh ww) h (ws1 ws2) d', h=self.num_heads,
-                            d=C//self.num_heads, hh=Hp//self.ws, ww=Wp//self.ws, qkv=3, ws1=self.ws, ws2=self.ws)
-
-        dots = (q @ k.transpose(-2, -1)) * self.scale
-
-        if self.relative_pos_embedding:
-            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-                self.ws * self.ws, self.ws * self.ws, -1)  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-            dots += relative_position_bias.unsqueeze(0)
-
-        attn = dots.softmax(dim=-1)
-        attn = attn @ v
-
-        attn = rearrange(attn, '(b hh ww) h (ws1 ws2) d -> b (h d) (hh ws1) (ww ws2)', h=self.num_heads,
-                         d=C//self.num_heads, hh=Hp//self.ws, ww=Wp//self.ws, ws1=self.ws, ws2=self.ws)
-
-        attn = attn[:, :, :H, :W]
-
-        out = self.attn_x(F.pad(attn, pad=(0, 0, 0, 1), mode='reflect')) + \
-                          self.attn_y(F.pad(attn, pad=(0, 1, 0, 0), mode='reflect'))
-
-        out = self.pad_out(out)
-        out = self.proj(out)
-        out = out[:, :, :H, :W]
-
-        return out
-
-
-class LocalAttention(nn.Module):
-    def __init__(self,
-                 dim=256,
-                 window_size=8,
-                 ):
+class MixStructureBlock(nn.Module):
+    def __init__(self, dim):
         super().__init__()
 
-        self.local = SppCSPC(dim, dim)
-        self.proj = SeparableConvBN(dim, dim, kernel_size=window_size)
+        self.norm1 = nn.BatchNorm2d(dim)
+        self.norm2 = nn.BatchNorm2d(dim)
 
-    def pad(self, x, ps):
-        _, _, H, W = x.size()
-        if W % ps != 0:
-            x = F.pad(x, (0, ps - W % ps), mode='reflect')
-        if H % ps != 0:
-            x = F.pad(x, (0, 0, 0, ps - H % ps), mode='reflect')
-        return x
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=1)
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=5, padding=2, padding_mode='reflect')
+        self.conv3_19 = nn.Conv2d(dim, dim, kernel_size=7, padding=9, groups=dim, dilation=3, padding_mode='reflect')
+        self.conv3_13 = nn.Conv2d(dim, dim, kernel_size=5, padding=6, groups=dim, dilation=3, padding_mode='reflect')
+        self.conv3_7 = nn.Conv2d(dim, dim, kernel_size=3, padding=3, groups=dim, dilation=3, padding_mode='reflect')
 
-    def pad_out(self, x):
-        x = F.pad(x, pad=(0, 1, 0, 1), mode='reflect')
-        return x
+        # Simple Pixel Attention
+        self.Wv = nn.Sequential(
+            nn.Conv2d(dim, dim, 1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=3 // 2, groups=dim, padding_mode='reflect')
+        )
+        self.Wg = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, dim, 1),
+            nn.Sigmoid()
+        )
+
+        # Channel Attention
+        self.ca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, dim, 1, padding=0, bias=True),
+            nn.GELU(),
+            # nn.ReLU(True),
+            nn.Conv2d(dim, dim, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+        # Pixel Attention
+        self.pa = nn.Sequential(
+            nn.Conv2d(dim, dim // 8, 1, padding=0, bias=True),
+            nn.GELU(),
+            # nn.ReLU(True),
+            nn.Conv2d(dim // 8, 1, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Conv2d(dim * 3, dim * 4, 1),
+            nn.GELU(),
+            # nn.ReLU(True),
+            nn.Conv2d(dim * 4, dim, 1)
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Conv2d(dim * 3, dim * 4, 1),
+            nn.GELU(),
+            # nn.ReLU(True),
+            nn.Conv2d(dim * 4, dim, 1)
+        )
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        local = self.local(x)
+        identity = x
+        x = self.norm1(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = torch.cat([self.conv3_19(x), self.conv3_13(x), self.conv3_7(x)], dim=1)
+        x = self.mlp(x)
+        x = identity + x
 
-        out = self.pad_out(local)
-        out = self.proj(out)
-        out = out[:, :, :H, :W]
-
-        return out
-
-
-
-class GlBlock(nn.Module):
-    expansion = 1
-    def __init__(self, dim=256, outdim=256, num_heads=16, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8, C=0, H=0, W=0):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = GlobalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        self.down = Conv(dim, outdim, kernel_size=3, stride=2, dilation=1, bias=False)
-
-    def forward(self, x):
-        x = self.down(x)
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+        identity = x
         x = self.norm2(x)
+        x = torch.cat([self.Wv(x) * self.Wg(x), self.ca(x) * x, self.pa(x) * x], dim=1)
+        x = self.mlp2(x)
+        x = identity + x
+        return x
+
+
+class ElementScale(nn.Module):
+    
+    def __init__(self, embed_dims, init_value=0., requires_grad=True):
+        super(ElementScale, self).__init__()  # 调用父类构造函数初始化模块
+
+
+        self.scale = nn.Parameter(
+            init_value * torch.ones((1, embed_dims, 1, 1)),  # 初始缩放因子
+            requires_grad=requires_grad  # 决定该参数是否参与梯度更新
+        )
+
+
+    def forward(self, x):
+        return x * self.scale  # 返回输入与缩放因子相乘的结果
+
+
+class MultiOrderDWConv(nn.Module):
+
+    
+    def __init__(self,
+                 embed_dims,
+                 dw_dilation=[1, 2, 3],
+                 channel_split=[1, 3, 4],
+                ):
+        super(MultiOrderDWConv, self).__init__()
+
+      
+        self.split_ratio = [i / sum(channel_split) for i in channel_split]
+
+        self.embed_dims_1 = int(self.split_ratio[1] * embed_dims)  
+        self.embed_dims_2 = int(self.split_ratio[2] * embed_dims) 
+        self.embed_dims_0 = embed_dims - self.embed_dims_1 - self.embed_dims_2  
+
+        self.embed_dims = embed_dims
+
+    
+        assert len(dw_dilation) == len(channel_split) == 3  
+        assert 1 <= min(dw_dilation) and max(dw_dilation) <= 3  
+        assert embed_dims % sum(channel_split) == 0  
+
+  
+        self.DW_conv0 = nn.Conv2d(
+            in_channels=self.embed_dims,
+            out_channels=self.embed_dims,
+            kernel_size=5,
+            padding=(1 + 4 * dw_dilation[0]) // 2, 
+            groups=self.embed_dims,            
+            stride=1,
+            dilation=dw_dilation[0],            
+        )
+
+        self.DW_conv1 = nn.Conv2d(
+            in_channels=self.embed_dims_1,
+            out_channels=self.embed_dims_1,
+            kernel_size=5,
+            padding=(1 + 4 * dw_dilation[1]) // 2,
+            groups=self.embed_dims_1,
+            stride=1,
+            dilation=dw_dilation[1],  # 膨胀率为2
+        )
+
+        self.DW_conv2 = nn.Conv2d(
+            in_channels=self.embed_dims_2,
+            out_channels=self.embed_dims_2,
+            kernel_size=7,
+            padding=(1 + 6 * dw_dilation[2]) // 2,
+            groups=self.embed_dims_2,
+            stride=1,
+            dilation=dw_dilation[2],  # 膨胀率为3
+        )
+        # 逐点卷积，用于融合各分支特征
+        self.PW_conv = nn.Conv2d(
+            in_channels=embed_dims,
+            out_channels=embed_dims,
+            kernel_size=1
+        )
+
+    def forward(self, x):
+        x_0 = self.DW_conv0(x)  # 对整个输入应用第一个5x5深度卷积
+
+        # 从x_0中截取第二部分通道，输入到第二个深度卷积
+        x_1 = self.DW_conv1(x_0[:, self.embed_dims_0: self.embed_dims_0 + self.embed_dims_1, ...])
+
+        # 从x_0中截取最后一部分通道，输入到第三个深度卷积
+        x_2 = self.DW_conv2(x_0[:, self.embed_dims - self.embed_dims_2:, ...])
+
+        # 在通道维度上拼接第一部分、第二部分和第三部分的输出
+        x = torch.cat([x_0[:, :self.embed_dims_0, ...], x_1, x_2], dim=1)
+
+        x = self.PW_conv(x)  # 使用1x1卷积融合拼接后的多分支特征
+        return x
+
+
+class MultiOrderGatedAggregation(nn.Module):
+
+    
+    def __init__(self,
+                 embed_dims,
+                 attn_dw_dilation=[1, 2, 3],
+                 attn_channel_split=[1, 3, 4],
+                 attn_force_fp32=False,
+                 ):
+        super(MultiOrderGatedAggregation, self).__init__()
+
+        self.embed_dims = embed_dims
+        self.attn_force_fp32 = attn_force_fp32
+        # 第一个1x1卷积，用于初步特征投影
+        self.proj_1 = nn.Conv2d(in_channels=embed_dims, out_channels=embed_dims, kernel_size=1)
+        # 门控分支：生成门控系数
+        self.gate = nn.Conv2d(in_channels=embed_dims, out_channels=embed_dims, kernel_size=1)
+        # 值分支：通过多阶深度卷积提取特征
+        self.value = MultiOrderDWConv(
+            embed_dims=embed_dims,
+            dw_dilation=attn_dw_dilation,
+            channel_split=attn_channel_split,
+        )
+
+        # 最终融合的1x1卷积层
+        self.proj_2 = nn.Conv2d(in_channels=embed_dims, out_channels=embed_dims, kernel_size=1)
+
+        # 使用SiLU激活函数分别激活门控和值分支
+        self.act_value = nn.SiLU()
+        self.act_gate = nn.SiLU()
+
+        # 使用ElementScale对特征进行微调分解
+        self.sigma = ElementScale(embed_dims, init_value=1e-5, requires_grad=True)
+
+
+    def feat_decompose(self, x):
+        # 通过1x1卷积先进行特征投影
+        x = self.proj_1(x)
+
+        # 对投影后的特征进行全局平均池化，获得全局统计信息
+        x_d = F.adaptive_avg_pool2d(x, output_size=1)
+
+        # 利用sigma对原始特征与全局均值的差异进行微调，并将结果加回原始特征中
+        x = x + self.sigma(x - x_d)
+        x = self.act_value(x)  # 应用激活函数，此处设计可根据需求调整
+        return x
+
+    def forward(self, x):
+        shortcut = x.clone()  # 保存输入以便后续残差连接
+
+        # 蓝色框部分：通过特征分解模块调整特征
+        x = self.feat_decompose(x)
+
+        # 灰色框部分：分别生成门控系数F和值特征G
+        F_branch = self.gate(x)
+        G_branch = self.value(x)
+
+        # 分别对F和值特征应用SiLU激活后逐元素相乘，并通过proj_2融合
+        x = self.proj_2(self.act_gate(F_branch) * self.act_gate(G_branch))
+        x = x + shortcut  # 添加残差连接以保留原始信息
 
         return x
 
 
-class multilocalBlock(nn.Module):
-    expansion = 1
-    def __init__(self, dim=256, outdim=256, num_heads=16, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8, C=0, H=0, W=0):
-        super().__init__()
-        self.down = Conv(dim, outdim, kernel_size=3, stride=2, dilation=1, bias=False)
-        self.norm1 = norm_layer(outdim)
-        self.attn = LocalAttention(outdim, window_size=window_size)
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(outdim)
+class Dense(nn.Module):
+    def __init__(self, in_channels):
+        super(Dense, self).__init__()
+        # 构造一系列3x3卷积层以逐步提取特征
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=1)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=1)
+        self.conv3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=1)
+        self.conv4 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=1)
+        self.conv5 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=1)
+        self.conv6 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=1)
+        self.gelu = nn.GELU()
 
     def forward(self, x):
-        x = self.down(x)
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = self.drop_path(self.norm2(x))
+        x1 = self.conv1(x)
+        x1 = self.gelu(x1 + x)
+        x2 = self.conv2(x1)
+        x2 = self.gelu(x2 + x1 + x)
+        x3 = self.conv3(x2)
+        x3 = self.gelu(x3 + x2 + x1 + x)
+        x4 = self.conv4(x3)
+        x4 = self.gelu(x4 + x3 + x2 + x1 + x)
+        x5 = self.conv5(x4)
+        x5 = self.gelu(x5 + x4 + x3 + x2 + x1 + x)
+        x6 = self.conv6(x5)
+        x6 = self.gelu(x6 + x5 + x4 + x3 + x2 + x1 + x)
+        return x6
 
+
+# Channel Attention (CA) Layer
+class CALayer(nn.Module):
+
+    def __init__(self, channel, reduction=16):
+        super(CALayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels, wave):
+        super(UNet, self).__init__()
+        # 定义UNet的编码器和解码器部分
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, in_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # 编码和解码过程
+        x = self.encoder(x)
+        x = self.decoder(x)
         return x
 
 
-
-class branch0(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
-        super(branch0, self).__init__()
-        self.scale = scale
-        self.out_channels = out_planes
-        inter_planes = in_planes // map_reduce
-        self.conv1 = BasicConv(in_planes, 2 * inter_planes, kernel_size=1, stride=stride)
-        self.conv2 = BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=1, relu=False)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x
-
-
-class branch1(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
-        super(branch1, self).__init__()
-        self.scale = scale
-        self.out_channels = out_planes
-        inter_planes = in_planes // map_reduce
-        self.conv1 = BasicConv(in_planes, inter_planes, kernel_size=1, stride=1)
-        self.conv2 = BasicConv(inter_planes, (inter_planes // 2) * 3, kernel_size=(1, 3), stride=stride, padding=(0, 1))
-        self.conv3 = BasicConv((inter_planes // 2) * 3, 2 * inter_planes, kernel_size=(3, 1), stride=stride, padding=(1, 0))
-        self.conv4 = BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=5, dilation=5, relu=False)
+class HLFD(nn.Module):
+    def __init__(self, dim, wave='haar'):
+        super(HLFD, self).__init__()
+        n_feats = dim
+        self.down = nn.AvgPool2d(kernel_size=2)
+        self.dense = Dense(n_feats)
+        self.unet = UNet(n_feats, wave)
+        self.alise1 = nn.Conv2d(2 * n_feats, n_feats, 1, 1, 0)
+        self.alise2 = nn.Conv2d(n_feats, n_feats, 3, 1, 1)
+        self.att = CALayer(n_feats)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        return x
-
-
-class branch2(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
-        super(branch2, self).__init__()
-        self.scale = scale
-        self.out_channels = out_planes
-        inter_planes = in_planes // map_reduce
-        self.conv1 = BasicConv(in_planes, inter_planes, kernel_size=1, stride=1)
-        self.conv2 = BasicConv(inter_planes, (inter_planes // 2) * 3, kernel_size=(3, 1), stride=stride, padding=(1, 0))
-        self.conv3 = BasicConv((inter_planes // 2) * 3, 2 * inter_planes, kernel_size=(1, 3), stride=stride, padding=(0, 1))
-        self.conv4 = BasicConv(2 * inter_planes, 2 * inter_planes, kernel_size=3, stride=1, padding=5, dilation=5, relu=False)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        return x
-
-
-class FEM(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
-        super(FEM, self).__init__()
-        self.scale = scale
-        self.out_channels = out_planes
-        inter_planes = in_planes // map_reduce
-        self.branch0 = branch0(in_planes, out_planes, stride, scale, map_reduce)
-        self.branch1 = branch1(in_planes, out_planes, stride, scale, map_reduce)
-        self.branch2 = branch2(in_planes, out_planes, stride, scale, map_reduce)
-
-        self.ConvLinear = BasicConv(6 * inter_planes, out_planes, kernel_size=1, stride=1, relu=False)
-        self.shortcut = BasicConv(in_planes, out_planes, kernel_size=1, stride=stride, relu=False)
-        self.relu = nn.ReLU(inplace=False)
-
-    def forward(self, x):
-        x0 = self.branch0(x)
-        x1 = self.branch1(x)
-        x2 = self.branch2(x)
-
-        out = torch.cat((x0, x1, x2), 1)
-        out = self.ConvLinear(out)
-        short = self.shortcut(x)
-        out = out * self.scale + short
-        out = self.relu(out)
-
-        return out
-
-
-
-class FMS(nn.Module):
-    def __init__(self, in_ch, out_ch, num_heads=8, window_size=8):
-        super(FMS, self).__init__()
-        self.wt = DWTForward(J=1, mode='zero', wave='haar')
-        self.glb = GlBlock(dim=in_ch, outdim=in_ch, num_heads=num_heads, window_size=window_size)
-        self.localb = multilocalBlock(dim=in_ch, outdim=in_ch, num_heads=8, window_size=window_size)
-        self.conv_bn_relu = nn.Sequential(
-            nn.Conv2d(in_ch * 3, in_ch, kernel_size=1, stride=1),
-            nn.BatchNorm2d(in_ch),
-            nn.ReLU(inplace=True),
-        )
-        self.outconv_bn_relu_L = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-        self.outconv_bn_relu_H = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-        self.outconv_bn_relu_glb = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-        self.outconv_bn_relu_local = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x, imagename=None):
-        yL, yH = self.wt(x)
-        y_HL = yH[0][:, :, 0, ::]
-        y_LH = yH[0][:, :, 1, ::]
-        y_HH = yH[0][:, :, 2, ::]
-
-        yH = torch.cat([y_HL, y_LH, y_HH], dim=1)
-        yH = self.conv_bn_relu(yH)
-
-        yL = self.outconv_bn_relu_L(yL)
-        yH = self.outconv_bn_relu_H(yH)
-
-        glb = self.outconv_bn_relu_glb(self.glb(x))
-        local = self.outconv_bn_relu_local(self.localb(x))
-
-        out = yL + yH + glb + local
-
+        # x: shape [B, 32, 64, 64]
+        low = self.down(x)  # 下采样得到低频信息 [B, 32, 32, 32]
+        up = F.interpolate(low, size=x.size()[-2:], mode='bilinear', align_corners=True)
+        high = x - up  # 提取高频细节
+        lowf = self.unet(low)  # 提取低频轮廓信息
+        highfeat = self.dense(high)  # 获取高频细节特征
+        lowfeat = F.interpolate(lowf, size=x.size()[-2:], mode='bilinear', align_corners=True)
+        temp = self.alise1(torch.cat([highfeat, lowfeat], dim=1))
+        temp = self.att(temp)
+        out = self.alise2(temp) + x
         return out

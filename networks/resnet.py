@@ -2,12 +2,16 @@ import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 from torch.nn import functional as F
 from typing import Any, cast, Dict, List, Optional, Union
-
-from .common import FEM, FMS
+import numpy as np
+from .common import HLFD, MultiOrderGatedAggregation, MixStructureBlock
 
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
            'resnet152']
+
+# Module enable flags
+
+
 
 
 model_urls = {
@@ -17,9 +21,6 @@ model_urls = {
     'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth',
     'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
 }
-
-FEM_en = True
-FMS_en = True
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -79,6 +80,9 @@ class Bottleneck(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
+        
+        if MSB_en:
+            self.MSB = MixStructureBlock(dim=planes)
 
     def forward(self, x):
         identity = x
@@ -91,6 +95,9 @@ class Bottleneck(nn.Module):
         out = self.bn2(out)
         out = self.relu(out)
 
+        if MSB_en:
+            out = self.MSB(out) + out
+            
         out = self.conv3(out)
         out = self.bn3(out)
 
@@ -117,20 +124,18 @@ class ResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer1 = self._make_layer(block, 64 , layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc1 = nn.Linear(512, num_classes)
-        
-        self.FEM_en = FEM_en
         self.FMS_en = FMS_en
-        
-        if self.FEM_en:
-            self.FEM = FEM(64, 64)
-            
-        if self.FMS_en:
-            self.FMS = FMS(64, 64)
+        self.maga_en = maga_en
 
+        if self.FMS_en:
+            self.FMS = HLFD(dim = 64)
+            
+        if self.maga_en:
+            self.maga = MultiOrderGatedAggregation(64)
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -163,26 +168,23 @@ class ResNet(nn.Module):
             layers.append(block(self.inplanes, planes))
 
         return nn.Sequential(*layers)
-
+        
     def interpolate(self, img, factor):
-        return F.interpolate(F.interpolate(img, scale_factor=factor, mode='nearest', recompute_scale_factor=True),
-                             scale_factor=1/factor, mode='nearest', recompute_scale_factor=True)
-
+        return F.interpolate(F.interpolate(img, scale_factor=factor, mode='nearest', recompute_scale_factor=True), scale_factor=1/factor, mode='nearest', recompute_scale_factor=True)
+        
     def forward(self, x):
-        NPR = x - self.interpolate(x, 0.5)
+        NPR  = x - self.interpolate(x, 0.5)
 
-        x = self.conv1(NPR * 2.0 / 3.0)
+        x = self.conv1(NPR*2.0/3.0)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
-
-        if self.FEM_en:
-            x = self.FEM(x) + x
-
+        if self.maga_en:
+            x = self.maga(x) + x
         if self.FMS_en:
             x = self.FMS(x) + x
-
         x = self.layer1(x)
+
         x = self.layer2(x)
 
         x = self.avgpool(x)

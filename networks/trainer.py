@@ -6,10 +6,7 @@ from networks.base_model import BaseModel, init_weights
 import torch.nn.functional as F
 import yaml
 
-with open('config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
-focal_en = config['focal_en']
-
+focal_en = True
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=1, gamma=2, reduction='mean'):

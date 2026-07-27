@@ -1,8 +1,4 @@
 
-> **Note:** This code is directly related to the manuscript submitted to *The Visual Computer*. If you use this code, please cite our paper (citation details will be updated upon acceptance).
-
----
-
 ## Overview
 
 FSI-Net is a unified frequency-spatial integrated network for generalizable deepfake detection. It combines:

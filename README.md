@@ -1,18 +1,5 @@
-# Frequency-Spatial Integrated Learning for Generalizable Deepfake Detection Across Unseen Generative Models
-
-**[The Visual Computer](https://www.springer.com/journal/371)** | Hengyang Normal University
 
 > **Note:** This code is directly related to the manuscript submitted to *The Visual Computer*. If you use this code, please cite our paper (citation details will be updated upon acceptance).
-
-```bibtex
-@article{he2025fsinet,
-  title={Frequency-Spatial Integrated Learning for Generalizable Deepfake Detection Across Unseen Generative Models},
-  author={He, Jia-Xin and Zhang, Yue-Tao and Zhao, Hui-Huang},
-  journal={The Visual Computer},
-  year={2025},
-  note={Under review}
-}
-```
 
 ---
 
